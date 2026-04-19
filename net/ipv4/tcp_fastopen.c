@@ -171,6 +171,7 @@ static void tcp_fastopen_cookie_gen(struct sock *sk,
 void tcp_fastopen_add_skb(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	u32 before_nxt, after_nxt;
 
 	if (TCP_SKB_CB(skb)->end_seq == tp->rcv_nxt)
 		return;
@@ -195,7 +196,13 @@ void tcp_fastopen_add_skb(struct sock *sk, struct sk_buff *skb)
 	TCP_SKB_CB(skb)->seq++;
 	TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_SYN;
 
+	before_nxt = tp->rcv_nxt - tp->rcv_wup;
 	tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+	after_nxt = tp->rcv_nxt - tp->rcv_wup;
+
+    	pr_info("TOM_RX before=%u after=%u delta=%d func=%s caller=%pS reason=fast_open_data_received\n",
+            	before_nxt, after_nxt, (int)after_nxt - (int)before_nxt, __func__, __builtin_return_address(0));
+
 	tcp_add_receive_queue(sk, skb);
 	tp->syn_data_acked = 1;
 
@@ -245,6 +252,7 @@ static struct sock *tcp_fastopen_create_child(struct sock *sk,
 	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
 	struct sock *child;
 	bool own_req;
+	u32 before_ack, after_ack;
 
 	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL,
 							 NULL, &own_req);
@@ -290,7 +298,14 @@ static struct sock *tcp_fastopen_create_child(struct sock *sk,
 	tcp_fastopen_add_skb(child, skb);
 
 	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt;
+	
+	before_ack = tp->rcv_nxt - tp->rcv_wup;
 	tp->rcv_wup = tp->rcv_nxt;
+	after_ack = tp->rcv_nxt - tp->rcv_wup;
+
+	pr_info("TOM_ACK before=%u after=%u delta=%d func=%s caller=%pS reason=fast_open_ack_sent\n",
+        	before_ack, after_ack, (int)after_ack - (int)before_ack, __func__, __builtin_return_address(0));
+
 	/* tcp_conn_request() is sending the SYNACK,
 	 * and queues the child into listener accept queue.
 	 */

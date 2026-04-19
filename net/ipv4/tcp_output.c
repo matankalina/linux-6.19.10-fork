@@ -266,6 +266,7 @@ static u16 tcp_select_window(struct sock *sk)
 	struct net *net = sock_net(sk);
 	u32 old_win = tp->rcv_wnd;
 	u32 cur_win, new_win;
+	u32 before_ack, after_ack;
 
 	/* Make the window 0 if we failed to queue the data because we
 	 * are out of memory.
@@ -273,7 +274,14 @@ static u16 tcp_select_window(struct sock *sk)
 	if (unlikely(inet_csk(sk)->icsk_ack.pending & ICSK_ACK_NOMEM)) {
 		tp->pred_flags = 0;
 		tp->rcv_wnd = 0;
+		
+		before_ack = tp->rcv_nxt - tp->rcv_wup;
 		tp->rcv_wup = tp->rcv_nxt;
+		after_ack = tp->rcv_nxt - tp->rcv_wup;
+
+		pr_info("TOM_ACK before=%u after=%u delta=%d func=%s caller=%pS reason=ack_sent_no_memory\n",
+        		before_ack, after_ack, (int)after_ack - (int)before_ack, __func__, __builtin_return_address(0));
+
 		return 0;
 	}
 
@@ -296,7 +304,13 @@ static u16 tcp_select_window(struct sock *sk)
 	}
 
 	tp->rcv_wnd = new_win;
+	
+	before_ack = tp->rcv_nxt - tp->rcv_wup;
 	tp->rcv_wup = tp->rcv_nxt;
+	after_ack = tp->rcv_nxt - tp->rcv_wup;
+
+	pr_info("TOM_ACK before=%u after=%u delta=%d func=%s caller=%pS reason=ack_sent\n",
+        	before_ack, after_ack, (int)after_ack - (int)before_ack, __func__, __builtin_return_address(0));
 
 	/* Make sure we do not exceed the maximum possible
 	 * scaled window.
@@ -4069,6 +4083,7 @@ static void tcp_connect_init(struct sock *sk)
 	__u8 rcv_wscale;
 	u16 user_mss;
 	u32 rcv_wnd;
+	u32 before_ack, after_ack, before_nxt, after_nxt;
 
 	/* We'll fix this up when we get a response from the other end.
 	 * See tcp_input.c:tcp_rcv_state_process case TCP_SYN_SENT.
@@ -4126,10 +4141,22 @@ static void tcp_connect_init(struct sock *sk)
 	WRITE_ONCE(tp->snd_nxt, tp->write_seq);
 
 	if (likely(!tp->repair))
+		before_nxt = tp->rcv_nxt - tp->rcv_wup;
 		tp->rcv_nxt = 0;
+		after_nxt = tp->rcv_nxt - tp->rcv_wup;
+
+    		pr_info("TOM_RX before=%u after=%u delta=%d func=%s caller=%pS reason=connection_starting\n",
+            		before_nxt, after_nxt, (int)after_nxt - (int)before_nxt, __func__, __builtin_return_address(0));
 	else
 		tp->rcv_tstamp = tcp_jiffies32;
+	
+	before_ack = tp->rcv_nxt - tp->rcv_wup;
 	tp->rcv_wup = tp->rcv_nxt;
+	after_ack = tp->rcv_nxt - tp->rcv_wup;
+
+	pr_info("TOM_ACK before=%u after=%u delta=%d func=%s caller=%pS reason=connection_starting\n",
+        	before_ack, after_ack, (int)after_ack - (int)before_ack, __func__, __builtin_return_address(0));
+
 	WRITE_ONCE(tp->copied_seq, tp->rcv_nxt);
 
 	inet_csk(sk)->icsk_rto = tcp_timeout_init(sk);
