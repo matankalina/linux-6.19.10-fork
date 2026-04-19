@@ -5056,6 +5056,20 @@ tcp_drop_reason(struct sock *sk, struct sk_buff *skb, enum skb_drop_reason reaso
 /* This one checks to see if we can put data from the
  * out_of_order queue into the receive_queue.
  */
+
+/* ================= PROJECT INSTRUMENTATION DECLARATIONS =================
+ * Forward declarations for helper functions used by receive-side
+ * instrumentation before their full definitions appear later in the file.
+ * ====================================================================== */
+static u32 tcp_rx_readable_queue_bytes(struct sock *sk);
+static u32 tcp_rx_ofo_queue_bytes(struct tcp_sock *tp);
+static void tcp_rx_log_state_change(struct sock *sk, struct sk_buff *skb,
+                                    const char *event, const char *note,
+                                    u32 readable_queue_bytes_before,
+                                    u32 readable_queue_bytes_after,
+                                    u32 ofo_queue_bytes_before,
+                            u32 ofo_queue_bytes_after);
+
 static void tcp_ofo_queue(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -5089,10 +5103,35 @@ static void tcp_ofo_queue(struct sock *sk)
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
+
+		/* ================= PROJECT INSTRUMENTATION =================
+		 * Snapshot queue state before OFO → readable promotion.
+		 * ========================================================== */
+		u32 readable_queue_bytes_before = tcp_rx_readable_queue_bytes(sk);
+		u32 ofo_queue_bytes_before = tcp_rx_ofo_queue_bytes(tp);
+
 		if (!eaten)
 			tcp_add_receive_queue(sk, skb);
 		else
 			kfree_skb_partial(skb, fragstolen);
+		/* ================= PROJECT INSTRUMENTATION =================
+		 * Log OFO promotion to readable queue.
+		 * ========================================================== */
+		{
+		       	u32 readable_queue_bytes_after = tcp_rx_readable_queue_bytes(sk);
+			u32 ofo_queue_bytes_after = tcp_rx_ofo_queue_bytes(tp);
+			tcp_rx_log_state_change(sk, skb,
+					eaten ?
+                                	"ofo_promote_coalesce" :
+                                	"ofo_promote_queue",
+                                	eaten ?
+                                	"ofo_segment_coalesced_into_readable_queue" :
+                                	"ofo_segment_promoted_to_readable_queue",
+                                	readable_queue_bytes_before,
+                                	readable_queue_bytes_after,
+                                	ofo_queue_bytes_before,
+                                	ofo_queue_bytes_after);
+		}
 
 		if (unlikely(fin)) {
 			tcp_fin(sk);
@@ -5149,14 +5188,46 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct rb_node **p, *parent;
-	struct sk_buff *skb1;
-	u32 seq, end_seq;
-	bool fragstolen;
+	
+	/* ===================================================================
+         * PROJECT INSTRUMENTATION HOOK
+         *
+         * tcp_data_queue_ofo() is instrumented here to log changes in the
+         * out_of_order_queue.
+         *
+         * These logs describe:
+         *   - OFO insertion
+         *   - OFO coalescing
+         *   - OFO overlap drop
+         *   - OFO replacement of an existing node
+         *
+         * NOTE:
+         * This instrumentation is observational only.
+         * It does not intentionally change TCP logic or behavior.
+         * =================================================================== */
+        u32 readable_queue_bytes_before = tcp_rx_readable_queue_bytes(sk);
+        u32 ofo_queue_bytes_before = tcp_rx_ofo_queue_bytes(tp);
+        struct sk_buff *skb1;
+        u32 seq, end_seq;
+        const char *event = NULL;
+        const char *note = NULL;
+        bool fragstolen;
 
 	tcp_save_lrcv_flowlabel(sk, skb);
 	tcp_data_ecn_check(sk, skb);
 
 	if (unlikely(tcp_try_rmem_schedule(sk, skb, skb->truesize))) {
+		/* ================= PROJECT INSTRUMENTATION =================
+                 * Event: OFO memory scheduling failed.
+                 * ========================================================== */
+                tcp_rx_log_state_change(sk, skb,
+                                        "ofo_memory_drop",
+                                        "failed_to_schedule_receive_memory",
+                                        readable_queue_bytes_before,
+                                        readable_queue_bytes_before,
+                                        ofo_queue_bytes_before,
+                                        ofo_queue_bytes_before);
+
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPOFODROP);
 		sk->sk_data_ready(sk);
 		tcp_drop_reason(sk, skb, SKB_DROP_REASON_PROTO_MEM);
@@ -5184,6 +5255,10 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 		rb_link_node(&skb->rbnode, NULL, p);
 		rb_insert_color(&skb->rbnode, &tp->out_of_order_queue);
 		tp->ooo_last_skb = skb;
+
+		event = "ofo_insert";
+                note = "first_ofo_tree_node";
+
 		goto end;
 	}
 
@@ -5192,6 +5267,16 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 	 */
 	if (tcp_ooo_try_coalesce(sk, tp->ooo_last_skb,
 				 skb, &fragstolen)) {
+		                /* ================= PROJECT INSTRUMENTATION =================
+                 * Event: OFO payload merged into an existing OFO skb.
+                 * ========================================================== */
+                tcp_rx_log_state_change(sk, skb,
+                                        "ofo_coalesce",
+                                        "payload_merged_into_existing_ofo_segment",
+                                        readable_queue_bytes_before,
+                                        tcp_rx_readable_queue_bytes(sk),
+                                        ofo_queue_bytes_before,
+                                        tcp_rx_ofo_queue_bytes(tp));
 coalesce_done:
 		/* For non sack flows, do not grow window to force DUPACK
 		 * and trigger fast retransmit.
@@ -5223,6 +5308,17 @@ coalesce_done:
 				/* All the bits are present. Drop. */
 				NET_INC_STATS(sock_net(sk),
 					      LINUX_MIB_TCPOFOMERGE);
+				/* =============== PROJECT INSTRUMENTATION ===============
+                                 * Event: incoming OFO skb is fully covered by
+                                 * existing OFO data and is dropped.
+                                 * ====================================================== */
+                                tcp_rx_log_state_change(sk, skb,
+                                                        "ofo_overlap_drop",
+                                                        "segment_fully_covered_by_existing_ofo_data",
+                                                        readable_queue_bytes_before,
+                                                        readable_queue_bytes_before,
+                                                        ofo_queue_bytes_before,
+                                                        ofo_queue_bytes_before);
 				tcp_drop_reason(sk, skb,
 						SKB_DROP_REASON_TCP_OFOMERGE);
 				skb = NULL;
@@ -5238,6 +5334,8 @@ coalesce_done:
 				 */
 				rb_replace_node(&skb1->rbnode, &skb->rbnode,
 						&tp->out_of_order_queue);
+				event = "ofo_replace";
+                                note = "incoming_segment_replaced_existing_ofo_node";
 				tcp_dsack_extend(sk,
 						 TCP_SKB_CB(skb1)->seq,
 						 TCP_SKB_CB(skb1)->end_seq);
@@ -5257,6 +5355,28 @@ insert:
 	/* Insert segment into RB tree. */
 	rb_link_node(&skb->rbnode, parent, p);
 	rb_insert_color(&skb->rbnode, &tp->out_of_order_queue);
+	if (!event) {
+		event = "ofo_insert";
+	}
+
+		/* ================= PROJECT INSTRUMENTATION =================
+	 * Event: rx_ofo_insert
+	 *
+	 * A received TCP segment has been inserted into the
+	 * out_of_order_queue because it cannot yet be delivered
+	 * to the application (missing earlier bytes).
+	 *
+	 * These bytes must still be accounted as unread data
+	 * because they were received by the TCP stack.
+	 * ========================================================== */
+
+	tcp_rx_log_state_change(sk, skb,
+				"rx_ofo_insert",
+				"segment_inserted_into_out_of_order_queue",
+				tcp_rx_readable_queue_bytes(sk),
+				tcp_rx_readable_queue_bytes(sk),
+				tcp_rx_ofo_queue_bytes(tp),
+				tcp_rx_ofo_queue_bytes(tp));
 
 merge_right:
 	/* Remove other segments covered by skb. */
@@ -5294,11 +5414,137 @@ end:
 	/* do not grow rcvbuf for not-yet-accepted or orphaned sockets. */
 	if (sk->sk_socket)
 		tcp_rcvbuf_grow(sk, tp->rcvq_space.space);
+	/* ================= PROJECT INSTRUMENTATION =================
+         * Final OFO state-change log for insert / replace style paths.
+         * ========================================================== */
+        if (event && skb) {
+                if (!note)
+                        note = "new_ofo_tree_node";
+
+                tcp_rx_log_state_change(sk, skb,
+                                        event,
+                                        note,
+                                        readable_queue_bytes_before,
+                                        tcp_rx_readable_queue_bytes(sk),
+                                        ofo_queue_bytes_before,
+                                        tcp_rx_ofo_queue_bytes(tp));
+        }
 }
 
+/* =======================================================================
+ * PROJECT INSTRUMENTATION (TCP RX UNREAD DATA TRACKING)
+ *
+ * Authors: Gal Kradshtein / Tom
+ * Project: TCP batching research instrumentation
+ * Kernel version: v6.19.10
+ *
+ * This block adds debugging instrumentation for tracking unread TCP
+ * payload bytes inside the TCP receive-side queues.
+ *
+ * The instrumentation observes:
+ *   - payload bytes currently queued in sk_receive_queue
+ *   - payload bytes currently queued in out_of_order_queue
+ *   - state changes caused by receive-side queue updates
+ *
+ * Logging prefix: TCP_RX_TRACE
+ *
+ * NOTE:
+ * This code is intended only for observation and logging.
+ * It does not intentionally change TCP logic or behavior.
+ * ======================================================================= */
+
+static u32 tcp_rx_skb_payload_start_seq(const struct sk_buff *skb)
+{
+	u32 start = TCP_SKB_CB(skb)->seq;
+
+	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)
+		start++;
+
+	return start;
+}
+
+static u32 tcp_rx_skb_payload_end_seq(const struct sk_buff *skb)
+{
+	return tcp_rx_skb_payload_start_seq(skb) + skb->len;
+}
+
+static u32 tcp_rx_readable_queue_bytes(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sk_buff *skb;
+	u32 copied_seq = READ_ONCE(tp->copied_seq);
+	u32 total = 0;
+
+	skb_queue_walk(&sk->sk_receive_queue, skb) {
+		u32 start = tcp_rx_skb_payload_start_seq(skb);
+		u32 end = tcp_rx_skb_payload_end_seq(skb);
+
+		if (after(end, copied_seq)) {
+			u32 unread_start = after(copied_seq, start) ? copied_seq : start;
+
+			total += end - unread_start;
+		}
+	}
+
+	return total;
+}
+
+static u32 tcp_rx_ofo_queue_bytes(struct tcp_sock *tp)
+{
+	struct rb_node *node;
+	u32 total = 0;
+
+	for (node = rb_first(&tp->out_of_order_queue); node; node = rb_next(node))
+		total += rb_to_skb(node)->len;
+
+	return total;
+}
+
+static void tcp_rx_log_state_change(struct sock *sk, struct sk_buff *skb,
+				    const char *event, const char *note,
+				    u32 readable_queue_bytes_before,
+				    u32 readable_queue_bytes_after,
+				    u32 ofo_queue_bytes_before,
+				    u32 ofo_queue_bytes_after)
+{
+	u32 skb_sequence_start = tcp_rx_skb_payload_start_seq(skb);
+	u32 skb_sequence_end = tcp_rx_skb_payload_end_seq(skb);
+	u32 skb_rcv_payload = skb_sequence_end - skb_sequence_start;
+
+	pr_info("[TCP_RX_TRACE] event=%s sk_pointer=%p skb_sequence_start=%u skb_sequence_end=%u skb_rcv_payload=%u readable_queue_bytes_before=%u readable_queue_bytes_after=%u ofo_queue_bytes_before=%u ofo_queue_bytes_after=%u total_unread_bytes_before=%u total_unread_bytes_after=%u note=%s\n",
+		event,
+		sk,
+		skb_sequence_start,
+		skb_sequence_end,
+		skb_rcv_payload,
+		readable_queue_bytes_before,
+		readable_queue_bytes_after,
+		ofo_queue_bytes_before,
+		ofo_queue_bytes_after,
+		readable_queue_bytes_before + ofo_queue_bytes_before,
+		readable_queue_bytes_after + ofo_queue_bytes_after,
+		note);
+}
+
+/* ====================== END PROJECT INSTRUMENTATION ===================== */
+
+/* =======================================================================
+ * PROJECT INSTRUMENTATION HOOK
+ *
+ * tcp_queue_rcv() is instrumented to log changes in unread TCP payload
+ * bytes when data is added to the readable receive queue.
+ *
+ * The original TCP logic is preserved.
+ * Only observation and logging were added.
+ * ======================================================================= */
 static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 				      bool *fragstolen)
 {
+	/* Snapshot queue state BEFORE modification */
+	u32 readable_queue_bytes_before = tcp_rx_readable_queue_bytes(sk);
+	u32 ofo_queue_bytes_before = tcp_rx_ofo_queue_bytes(tcp_sk(sk));
+	u32 readable_queue_bytes_after;
+	u32 ofo_queue_bytes_after;
 	int eaten;
 	struct sk_buff *tail = skb_peek_tail(&sk->sk_receive_queue);
 
@@ -5310,6 +5556,23 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 		tcp_add_receive_queue(sk, skb);
 		skb_set_owner_r(skb, sk);
 	}
+
+	/* Snapshot queue state AFTER modification */
+	readable_queue_bytes_after = tcp_rx_readable_queue_bytes(sk);
+	ofo_queue_bytes_after = tcp_rx_ofo_queue_bytes(tcp_sk(sk));
+
+	/* Log only real unread-byte changes */
+	if (readable_queue_bytes_before != readable_queue_bytes_after ||
+	    ofo_queue_bytes_before != ofo_queue_bytes_after)
+		tcp_rx_log_state_change(sk, skb,
+					eaten ? "inorder_coalesce" : "inorder_queue",
+					eaten ? "payload_merged_into_receive_queue_tail"
+					      : "new_readable_queue_entry",
+					readable_queue_bytes_before,
+					readable_queue_bytes_after,
+					ofo_queue_bytes_before,
+					ofo_queue_bytes_after);
+
 	return eaten;
 }
 
@@ -5378,6 +5641,28 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	bool fragstolen;
 	int eaten;
 
+	/* ===================================================================
+	 * PROJECT INSTRUMENTATION HOOK
+	 *
+	 * tcp_data_queue() is instrumented here only for classification logs.
+	 *
+	 * These logs explain why a received segment is treated as:
+	 *   - in-order
+	 *   - old / duplicate
+	 *   - partial overlap
+	 *   - out-of-order dispatch
+	 *
+	 * NOTE:
+	 * This instrumentation is observational only.
+	 * It does not intentionally change TCP logic or behavior.
+	 * =================================================================== */
+	u32 payload_sequence_start;
+	u32 payload_sequence_end;
+	u32 skb_rcv_payload;
+	u32 duplicate_prefix_bytes;
+	u32 new_suffix_bytes;
+
+
 	/* If a subflow has been reset, the packet should not continue
 	 * to be processed, drop the packet.
 	 */
@@ -5392,6 +5677,14 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	}
 	tcp_cleanup_skb(skb);
 	__skb_pull(skb, tcp_hdr(skb)->doff * 4);
+
+	/* ================= PROJECT INSTRUMENTATION =================
+	 * Compute payload-oriented sequence values after TCP header
+	 * removal so the logged byte counts represent application data.
+	 * ========================================================== */
+	payload_sequence_start = tcp_rx_skb_payload_start_seq(skb);
+	payload_sequence_end = tcp_rx_skb_payload_end_seq(skb);
+	skb_rcv_payload = payload_sequence_end - payload_sequence_start;
 
 	reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	tp->rx_opt.dsack = 0;
@@ -5419,6 +5712,18 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 
 		/* Ok. In sequence. In window. */
 queue_and_out:
+		/* ================= PROJECT INSTRUMENTATION =================
+		 * Classification log: segment is treated as in-order payload.
+		 * ========================================================== */
+		if (skb_rcv_payload && payload_sequence_start == tp->rcv_nxt)
+			tcp_rx_log_state_change(sk, skb,
+						"rx_inorder",
+						"segment_classified_as_inorder",
+						tcp_rx_readable_queue_bytes(sk),
+						tcp_rx_readable_queue_bytes(sk),
+						tcp_rx_ofo_queue_bytes(tp),
+						tcp_rx_ofo_queue_bytes(tp));
+		
 		if (tcp_try_rmem_schedule(sk, skb, skb->truesize)) {
 			/* TODO: maybe ratelimit these WIN 0 ACK ? */
 			inet_csk(sk)->icsk_ack.pending |=
@@ -5465,6 +5770,18 @@ queue_and_out:
 	if (!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt)) {
 		tcp_rcv_spurious_retrans(sk, skb);
 		/* A retransmit, 2nd most common case.  Force an immediate ack. */
+
+		/* ================= PROJECT INSTRUMENTATION =================
+		 * Classification log: segment contains only old/duplicate data.
+		 * ========================================================== */
+		tcp_rx_log_state_change(sk, skb,
+					"rx_old_data_drop",
+					"segment_fully_duplicate_or_old_data",
+					tcp_rx_readable_queue_bytes(sk),
+					tcp_rx_readable_queue_bytes(sk),
+					tcp_rx_ofo_queue_bytes(tp),
+					tcp_rx_ofo_queue_bytes(tp));
+
 		reason = SKB_DROP_REASON_TCP_OLD_DATA;
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_DELAYEDACKLOST);
 		tcp_dsack_set(sk, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
@@ -5496,8 +5813,41 @@ drop:
 			NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPZEROWINDOWDROP);
 			goto out_of_window;
 		}
+
+		/* ================= PROJECT INSTRUMENTATION =================
+		 * Classification log: segment contains a duplicate prefix and
+		 * a new suffix. Only the new suffix will be queued.
+		 * ========================================================== */
+		duplicate_prefix_bytes = tp->rcv_nxt - payload_sequence_start;
+		new_suffix_bytes = payload_sequence_end - tp->rcv_nxt;
+
+		pr_info("[TCP_RX_TRACE] event=rx_partial_overlap sk_pointer=%p skb_sequence_start=%u skb_sequence_end=%u skb_rcv_payload=%u readable_queue_bytes_before=%u readable_queue_bytes_after=%u ofo_queue_bytes_before=%u ofo_queue_bytes_after=%u total_unread_bytes_before=%u total_unread_bytes_after=%u duplicate_prefix_bytes=%u new_suffix_bytes=%u note=duplicate_prefix_ignored_only_new_suffix_is_queued\n",
+			sk,
+			payload_sequence_start,
+			payload_sequence_end,
+			skb_rcv_payload,
+			tcp_rx_readable_queue_bytes(sk),
+			tcp_rx_readable_queue_bytes(sk),
+			tcp_rx_ofo_queue_bytes(tp),
+			tcp_rx_ofo_queue_bytes(tp),
+			tcp_rx_readable_queue_bytes(sk) + tcp_rx_ofo_queue_bytes(tp),
+			tcp_rx_readable_queue_bytes(sk) + tcp_rx_ofo_queue_bytes(tp),
+			duplicate_prefix_bytes,
+			new_suffix_bytes);
+
 		goto queue_and_out;
 	}
+
+	/* ================= PROJECT INSTRUMENTATION =================
+	 * Classification log: segment is dispatched to the OFO queue.
+	 * ========================================================== */
+	tcp_rx_log_state_change(sk, skb,
+				"rx_ofo_dispatch",
+				"segment_dispatched_to_out_of_order_queue",
+				tcp_rx_readable_queue_bytes(sk),
+				tcp_rx_readable_queue_bytes(sk),
+				tcp_rx_ofo_queue_bytes(tp),
+				tcp_rx_ofo_queue_bytes(tp));
 
 	tcp_data_queue_ofo(sk, skb);
 }
