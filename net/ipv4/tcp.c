@@ -1944,6 +1944,103 @@ static void tcp_zerocopy_set_hint_for_skb(struct sock *sk,
 	zc->recv_skip_hint = mappable_offset + partial_frag_remainder;
 }
 
+/* =======================================================================
+ * PROJECT INSTRUMENTATION (TCP RX UNREAD DATA TRACKING)
+ *
+ * Authors: Gal Kradshtein / Tom
+ * Project: TCP batching research instrumentation
+ * Kernel version: v6.19.10
+ *
+ * This block adds debugging instrumentation for tracking unread TCP
+ * payload bytes on the read/consume side.
+ *
+ * The instrumentation observes:
+ *   - payload bytes currently queued in sk_receive_queue
+ *   - payload bytes currently queued in out_of_order_queue
+ *   - state changes caused by application reads
+ *
+ * Logging prefix: TCP_RX_TRACE
+ *
+ * NOTE:
+ * This code is intended only for observation and logging.
+ * It does not intentionally change TCP logic or behavior.
+ * ======================================================================= */
+
+static u32 tcp_rx_skb_payload_start_seq(const struct sk_buff *skb)
+{
+	u32 start = TCP_SKB_CB(skb)->seq;
+
+	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)
+		start++;
+
+	return start;
+}
+
+static u32 tcp_rx_skb_payload_end_seq(const struct sk_buff *skb)
+{
+	return tcp_rx_skb_payload_start_seq(skb) + skb->len;
+}
+
+static u32 tcp_rx_readable_queue_bytes(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sk_buff *skb;
+	u32 copied_seq = READ_ONCE(tp->copied_seq);
+	u32 total = 0;
+
+	skb_queue_walk(&sk->sk_receive_queue, skb) {
+		u32 start = tcp_rx_skb_payload_start_seq(skb);
+		u32 end = tcp_rx_skb_payload_end_seq(skb);
+
+		if (after(end, copied_seq)) {
+			u32 unread_start = after(copied_seq, start) ? copied_seq : start;
+
+			total += end - unread_start;
+		}
+	}
+
+	return total;
+}
+
+static u32 tcp_rx_ofo_queue_bytes(struct tcp_sock *tp)
+{
+	struct rb_node *node;
+	u32 total = 0;
+
+	for (node = rb_first(&tp->out_of_order_queue); node; node = rb_next(node))
+		total += rb_to_skb(node)->len;
+
+	return total;
+}
+
+static void tcp_rx_log_state_change(struct sock *sk, struct sk_buff *skb,
+				    const char *event, const char *note,
+				    u32 readable_queue_bytes_before,
+				    u32 readable_queue_bytes_after,
+				    u32 ofo_queue_bytes_before,
+				    u32 ofo_queue_bytes_after)
+{
+	u32 skb_sequence_start = tcp_rx_skb_payload_start_seq(skb);
+	u32 skb_sequence_end = tcp_rx_skb_payload_end_seq(skb);
+	u32 skb_rcv_payload = skb_sequence_end - skb_sequence_start;
+
+	pr_info("[TCP_RX_TRACE] event=%s sk_pointer=%p skb_sequence_start=%u skb_sequence_end=%u skb_rcv_payload=%u readable_queue_bytes_before=%u readable_queue_bytes_after=%u ofo_queue_bytes_before=%u ofo_queue_bytes_after=%u total_unread_bytes_before=%u total_unread_bytes_after=%u note=%s\n",
+		event,
+		sk,
+		skb_sequence_start,
+		skb_sequence_end,
+		skb_rcv_payload,
+		readable_queue_bytes_before,
+		readable_queue_bytes_after,
+		ofo_queue_bytes_before,
+		ofo_queue_bytes_after,
+		readable_queue_bytes_before + ofo_queue_bytes_before,
+		readable_queue_bytes_after + ofo_queue_bytes_after,
+		note);
+}
+
+/* ====================== END PROJECT INSTRUMENTATION ===================== */
+
 static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			      int flags, struct scm_timestamping_internal *tss,
 			      int *cmsg_flags);
@@ -2648,6 +2745,21 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 	u32 peek_offset = 0;
 	u32 urg_hole = 0;
 
+	/* ===================================================================
+	 * PROJECT INSTRUMENTATION HOOK
+	 *
+	 * tcp_recvmsg_locked() is instrumented here to log decreases in
+	 * unread TCP payload bytes caused by application reads.
+	 *
+	 * NOTE:
+	 * This instrumentation is observational only.
+	 * It does not intentionally change TCP logic or behavior.
+	 * =================================================================== */
+	u32 readable_queue_bytes_before = 0;
+	u32 ofo_queue_bytes_before = 0;
+	u32 readable_queue_bytes_after;
+	u32 ofo_queue_bytes_after;
+
 	err = -ENOTCONN;
 	if (sk->sk_state == TCP_LISTEN)
 		goto out;
@@ -2812,6 +2924,14 @@ found_ok_skb:
 					used = urg_offset;
 			}
 		}
+		
+		/* ================= PROJECT INSTRUMENTATION =================
+                 * Snapshot queue state before a non-PEEK application consume.
+                 * ========================================================== */
+                if (!(flags & MSG_PEEK) && used) {
+                        readable_queue_bytes_before = tcp_rx_readable_queue_bytes(sk);
+                        ofo_queue_bytes_before = tcp_rx_ofo_queue_bytes(tp);
+                }
 
 		if (!(flags & MSG_TRUNC)) {
 			if (last_copied_dmabuf != -1 &&
@@ -2859,6 +2979,27 @@ found_ok_skb:
 			sk_peek_offset_fwd(sk, used);
 		else
 			sk_peek_offset_bwd(sk, used);
+
+		/* ================= PROJECT INSTRUMENTATION =================
+		 * Log unread-byte decrease after a non-PEEK application read.
+		 * ========================================================== */
+		if (!(flags & MSG_PEEK) && used) {
+		       	readable_queue_bytes_after = tcp_rx_readable_queue_bytes(sk);
+			ofo_queue_bytes_after = tcp_rx_ofo_queue_bytes(tp);
+		       
+			tcp_rx_log_state_change(sk, skb,
+                                (used + offset < skb->len) ?
+                                "readable_consume_partial" :
+                                "readable_consume_full",
+                                (used + offset < skb->len) ?
+                                "application_read_consumed_part_of_readable_skb" :
+                                "application_read_consumed_remaining_readable_skb",
+                                readable_queue_bytes_before,
+                                readable_queue_bytes_after,
+                                ofo_queue_bytes_before,
+                                ofo_queue_bytes_after);
+		}
+
 		tcp_rcv_space_adjust(sk);
 
 skip_copy:
