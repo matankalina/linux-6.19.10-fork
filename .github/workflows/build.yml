@@ -1,0 +1,54 @@
+name: Build Kernel
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc flex bison libncurses-dev libelf-dev libssl-dev
+      
+      - name: Setup build directory
+        run: |
+          export KSRC=$(pwd)
+          export KOUT=$KSRC/build
+          mkdir -p $KOUT
+          echo "KOUT=$KOUT" >> $GITHUB_ENV
+      
+      - name: Copy kernel config
+        run: |
+          if [ -f .github/.config ]; then
+            cp .github/.config $KOUT/.config
+          else
+            # Fallback to tinyconfig if no config exists
+            make O=$KOUT tinyconfig
+          fi
+        env:
+          KOUT: ${{ env.KOUT }}
+      
+      - name: Compile kernel
+        run: |
+          make O=$KOUT -j$(nproc) bzImage
+        env:
+          KOUT: ${{ env.KOUT }}
+      
+      - name: Check build output
+        run: |
+          if [ -f "$KOUT/arch/x86/boot/bzImage" ]; then
+            echo "bzImage build successful"
+            ls -lh $KOUT/arch/x86/boot/bzImage
+          else
+            echo "bzImage not found"
+            exit 1
+          fi
+        env:
+          KOUT: ${{ env.KOUT }}
