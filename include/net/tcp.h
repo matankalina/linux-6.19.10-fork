@@ -466,6 +466,11 @@ void tcp_track_qstate_init(struct tcp_track_qstate *qs);
 void tcp_track_qstate_track(struct tcp_track_qstate *qs, s64 nitems);
 void tcp_track_qstate_sync(struct tcp_track_qstate *qs, s64 new_size);
 void tcp_track_init(struct sock *sk);
+
+void tcp_track_sync_unacked(struct sock *sk);
+void tcp_track_sync_unread(struct sock *sk);
+void tcp_track_sync_ackdelay(struct sock *sk);
+void tcp_track_sync_all(struct sock *sk);
 /* tcp_track_qstate functions end */
 
 void tcp_enter_loss(struct sock *sk);

@@ -496,6 +496,38 @@ void tcp_track_init(struct sock *sk)
 	tcp_track_qstate_init(&tp->track.ackdelay);
 }
 
+void tcp_track_sync_unacked(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_qstate_sync(&tp->track.unacked, sk->sk_wmem_queued);
+}
+
+void tcp_track_sync_unread(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_qstate_sync(&tp->track.unread,
+			      atomic_read(&sk->sk_rmem_alloc));
+}
+
+void tcp_track_sync_ackdelay(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	s64 ackdelay;
+
+	ackdelay = (s64)(tp->rcv_nxt - tp->rcv_wup);
+
+	tcp_track_qstate_sync(&tp->track.ackdelay, ackdelay);
+}
+
+void tcp_track_sync_all(struct sock *sk)
+{
+	tcp_track_sync_unacked(sk);
+	tcp_track_sync_unread(sk);
+	tcp_track_sync_ackdelay(sk);
+}
+
 void tcp_init_sock(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
