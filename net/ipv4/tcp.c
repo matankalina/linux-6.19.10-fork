@@ -434,10 +434,75 @@ EXPORT_IPV6_MOD_GPL(tcp_md5_destruct_sock);
  * NOTE: A lot of things set to zero explicitly by call to
  *       sk_alloc() so need not be done here.
  */
+
+/* Gal TCP queue tracking helpers.
+ *
+ * Implements the Track algorithm from the batching paper.
+ *
+ * Each queue state tracks:
+ *   time_ns  - timestamp of the last update
+ *   size     - current queue size
+ *   total    - cumulative amount that left the queue
+ *   integral - time-weighted queue size accumulator
+ *
+ * Current prototype unit: bytes.
+ */
+
+void tcp_track_qstate_init(struct tcp_track_qstate *qs)
+{
+	qs->time_ns = ktime_get_ns();
+	qs->size = 0;
+	qs->total = 0;
+	qs->integral = 0;
+}
+
+void tcp_track_qstate_track(struct tcp_track_qstate *qs, s64 nitems)
+{
+	u64 now = ktime_get_ns();
+	u64 dt = now - qs->time_ns;
+
+	/*
+	 * Integral is the area under the queue-size-over-time curve.
+	 * The queue had its old size for dt nanoseconds.
+	 */
+	if (qs->size > 0)
+		qs->integral += (u64)qs->size * dt;
+
+	qs->time_ns = now;
+	qs->size += nitems;
+
+	/*
+	 * The paper's total counter counts departures.
+	 * Therefore only negative changes are added to total.
+	 */
+	if (nitems < 0)
+		qs->total += (u64)(-nitems);
+}
+
+void tcp_track_qstate_sync(struct tcp_track_qstate *qs, s64 new_size)
+{
+	s64 nitems = new_size - qs->size;
+
+	if (nitems)
+		tcp_track_qstate_track(qs, nitems);
+}
+
+void tcp_track_init(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_qstate_init(&tp->track.unacked);
+	tcp_track_qstate_init(&tp->track.unread);
+	tcp_track_qstate_init(&tp->track.ackdelay);
+}
+
 void tcp_init_sock(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_init(sk);	
+	
 	int rto_min_us, rto_max_ms;
 
 	tp->out_of_order_queue = RB_ROOT;
