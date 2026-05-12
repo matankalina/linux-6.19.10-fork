@@ -1507,6 +1507,8 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 
 	lock_sock(sk);
 	ret = tcp_sendmsg_locked(sk, msg, size);
+	/* Gal added track here */
+	tcp_track_sync_unacked(sk);
 	release_sock(sk);
 
 	return ret;
@@ -3022,6 +3024,8 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 
 	lock_sock(sk);
 	ret = tcp_recvmsg_locked(sk, msg, len, flags, &tss, &cmsg_flags);
+	/* Gal added track here */
+	tcp_track_sync_unread(sk); 
 	release_sock(sk);
 
 	if ((cmsg_flags | msg->msg_get_inq) && ret >= 0) {

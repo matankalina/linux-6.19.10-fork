@@ -274,6 +274,8 @@ static u16 tcp_select_window(struct sock *sk)
 		tp->pred_flags = 0;
 		tp->rcv_wnd = 0;
 		tp->rcv_wup = tp->rcv_nxt;
+		/* Gal added track here */
+		tcp_track_sync_ackdelay(sk);
 		return 0;
 	}
 
@@ -297,6 +299,8 @@ static u16 tcp_select_window(struct sock *sk)
 
 	tp->rcv_wnd = new_win;
 	tp->rcv_wup = tp->rcv_nxt;
+	/* Gal added track here */
+	tcp_track_sync_ackdelay(sk);
 
 	/* Make sure we do not exceed the maximum possible
 	 * scaled window.
