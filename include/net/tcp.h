@@ -461,6 +461,18 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 			   bool *lost_race, enum skb_drop_reason *drop_reason);
 enum skb_drop_reason tcp_child_process(struct sock *parent, struct sock *child,
 				       struct sk_buff *skb);
+/* tcp_track_qstate functions by Gal */
+void tcp_track_qstate_init(struct tcp_track_qstate *qs);
+void tcp_track_qstate_track(struct tcp_track_qstate *qs, s64 nitems);
+void tcp_track_qstate_sync(struct tcp_track_qstate *qs, s64 new_size);
+void tcp_track_init(struct sock *sk);
+
+void tcp_track_sync_unacked(struct sock *sk);
+void tcp_track_sync_unread(struct sock *sk);
+void tcp_track_sync_ackdelay(struct sock *sk);
+void tcp_track_sync_all(struct sock *sk);
+/* tcp_track_qstate functions end */
+
 void tcp_enter_loss(struct sock *sk);
 void tcp_cwnd_reduction(struct sock *sk, int newly_acked_sacked, int newly_lost, int flag);
 void tcp_clear_retrans(struct tcp_sock *tp);

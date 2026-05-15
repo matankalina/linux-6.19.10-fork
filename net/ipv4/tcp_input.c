@@ -3597,6 +3597,8 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		}
 	}
 #endif
+	/* Gal added track here */
+	tcp_track_sync_unacked(sk);
 	return flag;
 }
 
@@ -5100,6 +5102,8 @@ static void tcp_ofo_queue(struct sock *sk)
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+		/* Gal added track here */
+		tcp_track_sync_ackdelay(sk);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
 		if (!eaten)
 			tcp_add_receive_queue(sk, skb);
@@ -5306,6 +5310,8 @@ end:
 	/* do not grow rcvbuf for not-yet-accepted or orphaned sockets. */
 	if (sk->sk_socket)
 		tcp_rcvbuf_grow(sk, tp->rcvq_space.space);
+
+	tcp_track_sync_unread(sk);
 }
 
 static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
@@ -5318,10 +5324,15 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 		 tcp_try_coalesce(sk, tail,
 				  skb, fragstolen)) ? 1 : 0;
 	tcp_rcv_nxt_update(tcp_sk(sk), TCP_SKB_CB(skb)->end_seq);
+	/* Gal added track here */
+	tcp_track_sync_ackdelay(sk);
 	if (!eaten) {
 		tcp_add_receive_queue(sk, skb);
 		skb_set_owner_r(skb, sk);
 	}
+	/* Gal added track here */
+	tcp_track_sync_unread(sk);	
+
 	return eaten;
 }
 
