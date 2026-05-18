@@ -4564,6 +4564,41 @@ int do_tcp_getsockopt(struct sock *sk, int level,
 	len = min_t(unsigned int, len, sizeof(int));
 
 	switch (optname) {
+	case TCP_QUEUE_STATE: {
+		struct tcp_queue_state_snapshot snap;
+
+		if (copy_from_sockptr(&len, optlen, sizeof(int)))
+			return -EFAULT;
+		if (len < sizeof(snap))
+			return -EINVAL;
+
+		lock_sock(sk);
+		tcp_track_sync_all(sk);
+
+		snap.unacked_time_ns   = tp->track.unacked.time_ns;
+		snap.unacked_integral  = tp->track.unacked.integral;
+		snap.unacked_total     = tp->track.unacked.total;
+		snap.unacked_size      = tp->track.unacked.size;
+
+		snap.unread_time_ns    = tp->track.unread.time_ns;
+		snap.unread_integral   = tp->track.unread.integral;
+		snap.unread_total      = tp->track.unread.total;
+		snap.unread_size       = tp->track.unread.size;
+
+		snap.ackdelay_time_ns  = tp->track.ackdelay.time_ns;
+		snap.ackdelay_integral = tp->track.ackdelay.integral;
+		snap.ackdelay_total    = tp->track.ackdelay.total;
+		snap.ackdelay_size     = tp->track.ackdelay.size;
+
+		release_sock(sk);
+
+		len = sizeof(snap);
+		if (copy_to_sockptr(optlen, &len, sizeof(int)))
+			return -EFAULT;
+		if (copy_to_sockptr(optval, &snap, sizeof(snap)))
+			return -EFAULT;
+		return 0;
+	}
 	case TCP_MAXSEG:
 		val = tp->mss_cache;
 		user_mss = READ_ONCE(tp->rx_opt.user_mss);
