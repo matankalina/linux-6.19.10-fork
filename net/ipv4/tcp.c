@@ -434,10 +434,107 @@ EXPORT_IPV6_MOD_GPL(tcp_md5_destruct_sock);
  * NOTE: A lot of things set to zero explicitly by call to
  *       sk_alloc() so need not be done here.
  */
+
+/* Gal TCP queue tracking helpers.
+ *
+ * Implements the Track algorithm from the batching paper.
+ *
+ * Each queue state tracks:
+ *   time_ns  - timestamp of the last update
+ *   size     - current queue size
+ *   total    - cumulative amount that left the queue
+ *   integral - time-weighted queue size accumulator
+ *
+ * Current prototype unit: bytes.
+ */
+
+void tcp_track_qstate_init(struct tcp_track_qstate *qs)
+{
+	qs->time_ns = ktime_get_ns();
+	qs->size = 0;
+	qs->total = 0;
+	qs->integral = 0;
+}
+
+void tcp_track_qstate_track(struct tcp_track_qstate *qs, s64 nitems)
+{
+	u64 now = ktime_get_ns();
+	u64 dt = now - qs->time_ns;
+
+	/*
+	 * Integral is the area under the queue-size-over-time curve.
+	 * The queue had its old size for dt nanoseconds.
+	 */
+	if (qs->size > 0)
+		qs->integral += (u64)qs->size * dt;
+
+	qs->time_ns = now;
+	qs->size += nitems;
+
+	/*
+	 * The paper's total counter counts departures.
+	 * Therefore only negative changes are added to total.
+	 */
+	if (nitems < 0)
+		qs->total += (u64)(-nitems);
+}
+
+void tcp_track_qstate_sync(struct tcp_track_qstate *qs, s64 new_size)
+{
+	s64 nitems = new_size - qs->size;
+
+	if (nitems)
+		tcp_track_qstate_track(qs, nitems);
+}
+
+void tcp_track_init(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_qstate_init(&tp->track.unacked);
+	tcp_track_qstate_init(&tp->track.unread);
+	tcp_track_qstate_init(&tp->track.ackdelay);
+}
+
+void tcp_track_sync_unacked(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_qstate_sync(&tp->track.unacked, sk->sk_wmem_queued);
+}
+
+void tcp_track_sync_unread(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_qstate_sync(&tp->track.unread,
+			      atomic_read(&sk->sk_rmem_alloc));
+}
+
+void tcp_track_sync_ackdelay(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	s64 ackdelay;
+
+	ackdelay = (s64)(tp->rcv_nxt - tp->rcv_wup);
+
+	tcp_track_qstate_sync(&tp->track.ackdelay, ackdelay);
+}
+
+void tcp_track_sync_all(struct sock *sk)
+{
+	tcp_track_sync_unacked(sk);
+	tcp_track_sync_unread(sk);
+	tcp_track_sync_ackdelay(sk);
+}
+
 void tcp_init_sock(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_track_init(sk);	
+	
 	int rto_min_us, rto_max_ms;
 
 	tp->out_of_order_queue = RB_ROOT;
@@ -1410,6 +1507,8 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 
 	lock_sock(sk);
 	ret = tcp_sendmsg_locked(sk, msg, size);
+	/* Gal added track here */
+	tcp_track_sync_unacked(sk);
 	release_sock(sk);
 
 	return ret;
@@ -2925,6 +3024,8 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 
 	lock_sock(sk);
 	ret = tcp_recvmsg_locked(sk, msg, len, flags, &tss, &cmsg_flags);
+	/* Gal added track here */
+	tcp_track_sync_unread(sk); 
 	release_sock(sk);
 
 	if ((cmsg_flags | msg->msg_get_inq) && ret >= 0) {
@@ -4463,6 +4564,41 @@ int do_tcp_getsockopt(struct sock *sk, int level,
 	len = min_t(unsigned int, len, sizeof(int));
 
 	switch (optname) {
+	case TCP_QUEUE_STATE: {
+		struct tcp_queue_state_snapshot snap;
+
+		if (copy_from_sockptr(&len, optlen, sizeof(int)))
+			return -EFAULT;
+		if (len < sizeof(snap))
+			return -EINVAL;
+
+		lock_sock(sk);
+		tcp_track_sync_all(sk);
+
+		snap.unacked_time_ns   = tp->track.unacked.time_ns;
+		snap.unacked_integral  = tp->track.unacked.integral;
+		snap.unacked_total     = tp->track.unacked.total;
+		snap.unacked_size      = tp->track.unacked.size;
+
+		snap.unread_time_ns    = tp->track.unread.time_ns;
+		snap.unread_integral   = tp->track.unread.integral;
+		snap.unread_total      = tp->track.unread.total;
+		snap.unread_size       = tp->track.unread.size;
+
+		snap.ackdelay_time_ns  = tp->track.ackdelay.time_ns;
+		snap.ackdelay_integral = tp->track.ackdelay.integral;
+		snap.ackdelay_total    = tp->track.ackdelay.total;
+		snap.ackdelay_size     = tp->track.ackdelay.size;
+
+		release_sock(sk);
+
+		len = sizeof(snap);
+		if (copy_to_sockptr(optlen, &len, sizeof(int)))
+			return -EFAULT;
+		if (copy_to_sockptr(optval, &snap, sizeof(snap)))
+			return -EFAULT;
+		return 0;
+	}
 	case TCP_MAXSEG:
 		val = tp->mss_cache;
 		user_mss = READ_ONCE(tp->rx_opt.user_mss);

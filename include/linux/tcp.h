@@ -197,7 +197,33 @@ static inline bool tcp_rsk_used_ao(const struct request_sock *req)
 
 #define TCP_RMEM_TO_WIN_SCALE 8
 
+/* Gal TCP queue tracking state.
+ *
+ * Implements the queue-state tuple from the Track algorithm:
+ *   time     - timestamp of the last update
+ *   size     - current queue size
+ *   total    - cumulative number of items that left the queue
+ *   integral - time-weighted queue size accumulator
+ *
+ * Current prototype unit: bytes.
+ */
+struct tcp_track_qstate {
+	u64 time_ns;
+	s64 size;
+	u64 total;
+	u64 integral;
+};
+
+struct tcp_track_state {
+	struct tcp_track_qstate unacked;
+	struct tcp_track_qstate unread;
+	struct tcp_track_qstate ackdelay;
+};
+
 struct tcp_sock {
+	
+	struct tcp_track_state track;	
+
 	/* Cacheline organization can be found documented in
 	 * Documentation/networking/net_cachelines/tcp_sock.rst.
 	 * Please update the document when adding new fields.

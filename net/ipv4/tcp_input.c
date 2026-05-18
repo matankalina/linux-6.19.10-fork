@@ -3597,6 +3597,8 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		}
 	}
 #endif
+	/* Gal added track here */
+	tcp_track_sync_unacked(sk);
 	return flag;
 }
 
@@ -3731,12 +3733,24 @@ static void tcp_rcv_sne_update(struct tcp_sock *tp, u32 seq)
 /* If we update tp->rcv_nxt, also update tp->bytes_received */
 static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
 {
+	u32 before, before_nxt, after, after_nxt;
 	u32 delta = seq - tp->rcv_nxt;
 
 	sock_owned_by_me((struct sock *)tp);
 	tp->bytes_received += delta;
 	tcp_rcv_sne_update(tp, seq);
+	
+	before = tp->rcv_nxt - tp->rcv_wup;
+	before_nxt = tp->rcv_nxt;
 	WRITE_ONCE(tp->rcv_nxt, seq);
+	after = tp->rcv_nxt - tp->rcv_wup;
+	after_nxt = tp->rcv_nxt;
+
+	if (after_nxt != before_nxt) {
+            	pr_info("TOM_RX before=%u after=%u delta=%d func=%s caller=%pS reason=new_data_received\n",
+        		before, after, (int)after - (int)before, __func__,
+        		__builtin_return_address(0));
+	}
 }
 
 /* Update our send window.
@@ -5088,6 +5102,8 @@ static void tcp_ofo_queue(struct sock *sk)
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+		/* Gal added track here */
+		tcp_track_sync_ackdelay(sk);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
 		if (!eaten)
 			tcp_add_receive_queue(sk, skb);
@@ -5294,6 +5310,8 @@ end:
 	/* do not grow rcvbuf for not-yet-accepted or orphaned sockets. */
 	if (sk->sk_socket)
 		tcp_rcvbuf_grow(sk, tp->rcvq_space.space);
+
+	tcp_track_sync_unread(sk);
 }
 
 static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
@@ -5306,10 +5324,15 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 		 tcp_try_coalesce(sk, tail,
 				  skb, fragstolen)) ? 1 : 0;
 	tcp_rcv_nxt_update(tcp_sk(sk), TCP_SKB_CB(skb)->end_seq);
+	/* Gal added track here */
+	tcp_track_sync_ackdelay(sk);
 	if (!eaten) {
 		tcp_add_receive_queue(sk, skb);
 		skb_set_owner_r(skb, sk);
 	}
+	/* Gal added track here */
+	tcp_track_sync_unread(sk);	
+
 	return eaten;
 }
 
@@ -6642,6 +6665,7 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_fastopen_cookie foc = { .len = -1 };
 	int saved_clamp = tp->rx_opt.mss_clamp;
+	u32 before_ack, after_ack, before_nxt, after_nxt;
 	bool fastopen_fail;
 	SKB_DR(reason);
 
@@ -6721,8 +6745,19 @@ consume:
 		/* Ok.. it's good. Set up sequence numbers and
 		 * move to established.
 		 */
+		before_nxt = tp->rcv_nxt - tp->rcv_wup;
 		WRITE_ONCE(tp->rcv_nxt, TCP_SKB_CB(skb)->seq + 1);
+		after_nxt = tp->rcv_nxt - tp->rcv_wup;
+
+    		pr_info("TOM_RX before=%u after=%u delta=%d func=%s caller=%pS reason=connection_established\n",
+            		before_nxt, after_nxt, (int)after_nxt - (int)before_nxt, __func__, __builtin_return_address(0));
+		
+		before_ack = tp->rcv_nxt - tp->rcv_wup;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+		after_ack = tp->rcv_nxt - tp->rcv_wup;
+
+		pr_info("TOM_ACK before=%u after=%u delta=%d func=%s caller=%pS reason=connection_established\n",
+        		before_ack, after_ack, (int)after_ack - (int)before_ack, __func__, __builtin_return_address(0));
 
 		/* RFC1323: The window in SYN & SYN/ACK segments is
 		 * never scaled.
@@ -6832,9 +6867,24 @@ consume:
 			tp->tcp_header_len = sizeof(struct tcphdr);
 		}
 
+		before_nxt = tp->rcv_nxt - tp->rcv_wup;
 		WRITE_ONCE(tp->rcv_nxt, TCP_SKB_CB(skb)->seq + 1);
+		after_nxt = tp->rcv_nxt;
+
+		if (after_nxt != before_nxt) {
+    			pr_info("TOM_RX before=%u after=%u delta=%d func=%s caller=%pS reason=simultaneous_open\n",
+            		before_nxt, after_nxt, (int)after_nxt - (int)before_nxt, __func__, __builtin_return_address(0));
+		}
+		
 		WRITE_ONCE(tp->copied_seq, tp->rcv_nxt);
+		
+		before_ack = tp->rcv_nxt - tp->rcv_wup;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+		after_ack = tp->rcv_nxt - tp->rcv_wup;
+
+		pr_info("TOM_ACK before=%u after=%u delta=%d func=%s caller=%pS reason=simultaneous_open\n",
+        		before_ack, after_ack, (int)after_ack - (int)before_ack, __func__, __builtin_return_address(0));
+
 
 		/* RFC1323: The window in SYN & SYN/ACK segments is
 		 * never scaled.

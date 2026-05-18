@@ -501,4 +501,24 @@ struct tcp_zerocopy_receive {
 	__u32 msg_flags;
 	__u32 reserved; /* set to 0 for now */
 };
+
+#define TCP_QUEUE_STATE		100
+
+struct tcp_queue_state_snapshot {
+	__u64 unacked_time_ns;
+	__u64 unacked_integral;
+	__u64 unacked_total;
+	__s64 unacked_size;
+
+	__u64 unread_time_ns;
+	__u64 unread_integral;
+	__u64 unread_total;
+	__s64 unread_size;
+
+	__u64 ackdelay_time_ns;
+	__u64 ackdelay_integral;
+	__u64 ackdelay_total;
+	__s64 ackdelay_size;
+};
+
 #endif /* _UAPI_LINUX_TCP_H */
